@@ -60,7 +60,7 @@ type FileBackedDevice struct {
 	SetSynced              context.CancelFunc
 	resumable              bool
 	log                    *logrus.Logger
-	bd                     *buseDevice
+	bd                     KernelClient
 	enableBackgroundSync   bool
 	copyRateBytesPerSecond uint64
 	copyRateLock           *sync.Mutex
@@ -261,7 +261,7 @@ func (d *FileBackedDevice) Connect() error {
 	}
 
 	if d.bd == nil {
-		buseDevice, err := createNbdDevice(
+		buseDevice, err := createNbdKernelClient(
 			d.nbdFile,
 			calculateNbdSize(d.Source.Size),
 			d,
@@ -274,7 +274,7 @@ func (d *FileBackedDevice) Connect() error {
 		d.bd = buseDevice
 	}
 
-	return d.bd.connect()
+	return d.bd.Connect()
 }
 
 // Disconnect terminates the NBD driver connection. This call blocks
@@ -285,7 +285,7 @@ func (d *FileBackedDevice) Disconnect() {
 	d.terminationFunction()
 	d.terminationWaitGroup.Wait()
 	if d.bd != nil {
-		d.bd.disconnect()
+		d.bd.Disconnect()
 	}
 	d.Finalize()
 }

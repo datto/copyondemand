@@ -43,7 +43,7 @@ func ioctl(fd, op, arg uintptr) {
 	}
 }
 
-func opDeviceRead(driver buseInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error {
+func opDeviceRead(driver kernelDriverInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error {
 	if err := driver.ReadAt(chunk, request.From); err != nil {
 		logrus.Errorf("buseDriver.ReadAt returned an error: %s", err)
 		// Reply with an EPERM
@@ -61,7 +61,7 @@ func opDeviceRead(driver buseInterface, fp *os.File, fpLock *sync.Mutex, chunk [
 	return nil
 }
 
-func opDeviceWrite(driver buseInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error {
+func opDeviceWrite(driver kernelDriverInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error {
 	if err := driver.WriteAt(chunk, request.From); err != nil {
 		logrus.Errorf("buseDriver.WriteAt returned an error: %s", err)
 		reply.Error = 1
@@ -75,13 +75,13 @@ func opDeviceWrite(driver buseInterface, fp *os.File, fpLock *sync.Mutex, chunk 
 	return nil
 }
 
-func opDeviceDisconnect(driver buseInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error {
+func opDeviceDisconnect(driver kernelDriverInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error {
 	logrus.Debug("Calling buseDriver.Disconnect()")
 	driver.DriverDisconnect()
 	return fmt.Errorf("Received a disconnect")
 }
 
-func opDeviceFlush(driver buseInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error {
+func opDeviceFlush(driver kernelDriverInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error {
 	if err := driver.Flush(); err != nil {
 		logrus.Errorf("buseDriver.Flush returned an error: %s", err)
 		reply.Error = 1
@@ -95,7 +95,7 @@ func opDeviceFlush(driver buseInterface, fp *os.File, fpLock *sync.Mutex, chunk 
 	return nil
 }
 
-func opDeviceTrim(driver buseInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error {
+func opDeviceTrim(driver kernelDriverInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error {
 	if err := driver.Trim(request.From, uint64(request.Length)); err != nil {
 		logrus.Errorf("buseDriver.Flush returned an error: %s", err)
 		reply.Error = 1
@@ -109,7 +109,7 @@ func opDeviceTrim(driver buseInterface, fp *os.File, fpLock *sync.Mutex, chunk [
 	return nil
 }
 
-func (bd *buseDevice) startNBDClient() {
+func (bd *nbdKernelClient) startNBDClient() {
 	ioctl(bd.deviceFp.Fd(), nbdSetSock, uintptr(bd.socketPair[1]))
 	// The call below may fail on some systems (if flags unset), could be ignored
 	ioctl(bd.deviceFp.Fd(), nbdSetFlags, nbdFlagSendTrim)
@@ -121,7 +121,7 @@ func (bd *buseDevice) startNBDClient() {
 }
 
 // Disconnect disconnects the BuseDevice
-func (bd *buseDevice) disconnect() {
+func (bd *nbdKernelClient) Disconnect() {
 	bd.stateLock.Lock()
 	connected := bd.connected
 	if !connected {
@@ -170,9 +170,9 @@ func writeNbdReply(reply *nbdReply) []byte {
 
 // Connect connects a BuseDevice to an actual device file
 // and starts handling requests. It does not return until it's done serving requests.
-func (bd *buseDevice) connect() error {
+func (bd *nbdKernelClient) Connect() error {
 	go bd.startNBDClient()
-	defer bd.disconnect()
+	defer bd.Disconnect()
 	for i := 0; i < requestWorkerCount; i++ {
 		go bd.requestWorker()
 	}
@@ -225,7 +225,7 @@ type queuedNbdRequest struct {
 	reply       *nbdReply
 }
 
-func (bd *buseDevice) requestWorker() {
+func (bd *nbdKernelClient) requestWorker() {
 	for true {
 		req := <-bd.queue
 		var affectedBlocks *BlockRange
@@ -244,14 +244,16 @@ func (bd *buseDevice) requestWorker() {
 	}
 }
 
-func createNbdDevice(
+func (bd *nbdKernelClient) sealed() {}
+
+func createNbdKernelClient(
 	device string,
 	size uint64,
-	buseDriver buseInterface,
+	buseDriver kernelDriverInterface,
 	bufferPool *bytePool,
 	blockRangePool *sync.Pool,
-) (*buseDevice, error) {
-	buseDeviceInternal := &buseDevice{
+) (KernelClient, error) {
+	buseDeviceInternal := &nbdKernelClient{
 		size:        size,
 		device:      device,
 		driver:      buseDriver,

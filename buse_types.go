@@ -82,7 +82,7 @@ type nbdReply struct {
 	Handle uint64
 }
 
-type buseInterface interface {
+type kernelDriverInterface interface {
 	ReadAt(p []byte, off uint64) error
 	WriteAt(p []byte, off uint64) error
 	DriverDisconnect()
@@ -90,13 +90,14 @@ type buseInterface interface {
 	Trim(off uint64, length uint64) error
 }
 
-type buseDevice struct {
+// nbdKernelClient is the kernel client that can connect to NBD
+type nbdKernelClient struct {
 	size           uint64
 	device         string
-	driver         buseInterface
+	driver         kernelDriverInterface
 	deviceFp       *os.File
 	socketPair     [2]int
-	op             [5]func(driver buseInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error
+	op             [5]func(driver kernelDriverInterface, fp *os.File, fpLock *sync.Mutex, chunk []byte, request *nbdRequest, reply *nbdReply) error
 	disconnectChan chan int
 	connected      bool
 	stateLock      sync.Mutex
