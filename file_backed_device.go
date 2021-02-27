@@ -229,6 +229,7 @@ func setDefaultsAndCopy(config *DriverConfig) (*DriverConfig, error) {
 		Log:                  config.Log,
 		EnableBackgroundSync: config.EnableBackgroundSync,
 		Resumable:            config.Resumable,
+		UseDblockDriver:      config.UseDblockDriver,
 	}
 
 	if newConfig.Log == nil {

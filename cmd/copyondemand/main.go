@@ -66,7 +66,7 @@ func (i *ProgressFiles) Set(value string) error {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s [-v] [-vv] [--progress-handle file_path] /dev/nbdX [file_to_mirror] [backing_file]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s [-v] [-vv] [-b] [--progress-handle file_path] /dev/X [file_to_mirror] [backing_file]\n", os.Args[0])
 	flag.PrintDefaults()
 
 	os.Exit(2)
