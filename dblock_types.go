@@ -1,10 +1,21 @@
 package copyondemand
 
+import (
+	"os"
+
+	"github.com/sirupsen/logrus"
+)
+
 const dblockBlockSize = 4096
 
 const maxDiskNameLength = 32
 const maxBioSegmentsPerRequest = 256
 const maxBioSegmentsBufferSizePerRequest = 256 * dblockBlockSize
+
+const dblockControlCreateDevice = uint64(21)
+const dblockControlDestroyDeviceByID = uint64(22)
+const dblockControlDestroyDeviceByName = uint64(23)
+const dblockControlDestroyAllDevices = uint64(25)
 
 const dblockOperationNoResponseBlockForRequest = 30
 const dblockOperationReadResponse = 31
@@ -12,6 +23,8 @@ const dblockOperationStatus = 39
 const dblockOperationKernelBlockForRequest = 40
 const dblockOperationKernelWriteRequest = 41
 const dblockOperationKernelUserspaceExit = 42
+
+const dblockControlDevicePath = "/dev/dblockctl"
 
 type dblockControlCreateDeviceParams struct {
 	deviceName            [maxDiskNameLength]byte
@@ -69,7 +82,10 @@ type dblockKernelClient struct {
 	driver         kernelDriverInterface
 	disconnectChan chan int
 	connected      bool
+	logger         *logrus.Logger
 	bufferPool     *bytePool
 	queue          chan *queuedDblockRequest
 	rangeLocker    *RangeLocker
+	controlFp      *os.File
+	deviceHandleID uint32
 }

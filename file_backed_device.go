@@ -293,6 +293,7 @@ func (d *FileBackedDevice) Connect() error {
 				d,
 				newBytePool(d.log),
 				d.blockRangePool,
+				d.log,
 			)
 		} else {
 			device, err = createNbdKernelClient(
