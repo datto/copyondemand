@@ -33,6 +33,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -43,7 +44,7 @@ import (
 type FileBackedDevice struct {
 	Source                 *SyncSource
 	BackingFile            *SyncFile
-	nbdFile                string
+	blockDeviceName        string
 	processFiles           []string
 	terminationContext     context.Context
 	terminationFunction    context.CancelFunc
@@ -59,6 +60,7 @@ type FileBackedDevice struct {
 	isSyncedCtx            context.Context
 	SetSynced              context.CancelFunc
 	resumable              bool
+	useDblockDriver        bool
 	log                    *logrus.Logger
 	bd                     KernelClient
 	enableBackgroundSync   bool
@@ -73,25 +75,43 @@ type FileBackedDevice struct {
 type DriverConfig struct {
 	Source               *SyncSource
 	Backing              *SyncFile
-	NbdFileName          string
+	BlockDeviceName      string
 	ProcessFiles         []string
 	Fs                   FileSystem
 	Log                  *logrus.Logger
 	EnableBackgroundSync bool
 	Resumable            bool
+	UseDblockDriver      bool
 }
 
 // NewFileBackedDevice constructs a FileBackedDevice based on a source file
 func NewFileBackedDevice(
 	sourceFileName string,
 	backingFileName string,
-	nbdFileName string,
+	blockDeviceName string,
 	processFiles []string,
 	fs FileSystem,
 	log *logrus.Logger,
 	enableBackgroundSync bool,
 	resumable bool,
+	useDblockDriver bool,
 ) (*FileBackedDevice, error) {
+	if !useDblockDriver && !strings.HasPrefix(blockDeviceName, "/dev/nbd") {
+		return nil, fmt.Errorf("expected nbd block device name to begin with /dev/nbd*")
+	} else if useDblockDriver {
+		if !strings.HasPrefix(blockDeviceName, "/dev/") {
+			return nil, fmt.Errorf("block device must be placed in /dev/")
+		}
+
+		if _, err := os.Stat(blockDeviceName); !os.IsNotExist(err) {
+			return nil, fmt.Errorf("a block device with the name %s already exists", blockDeviceName)
+		}
+
+		if len(blockDeviceName) > (maxDiskNameLength + 5) {
+			return nil, fmt.Errorf("file name %s is too large", blockDeviceName)
+		}
+	}
+
 	sourceFileInfo, err := fs.Stat(sourceFileName)
 	if err != nil {
 		return nil, fmt.Errorf("source file %s does not exist", sourceFileName)
@@ -133,12 +153,13 @@ func NewFileBackedDevice(
 	config := &DriverConfig{
 		Source:               sourceFile,
 		Backing:              backingFile,
-		NbdFileName:          nbdFileName,
+		BlockDeviceName:      blockDeviceName,
 		ProcessFiles:         processFiles,
 		Fs:                   fs,
 		Log:                  log,
 		EnableBackgroundSync: enableBackgroundSync,
 		Resumable:            resumable,
+		UseDblockDriver:      useDblockDriver,
 	}
 
 	return New(config)
@@ -177,7 +198,7 @@ func New(config *DriverConfig) (*FileBackedDevice, error) {
 	driver := &FileBackedDevice{
 		Source:                 config.Source,
 		BackingFile:            config.Backing,
-		nbdFile:                config.NbdFileName,
+		blockDeviceName:        config.BlockDeviceName,
 		blockMap:               blockMap,
 		blockMapIntentLogger:   blockMapIntentLogger,
 		dirtyBlockMap:          dirtyBlockMap,
@@ -189,6 +210,7 @@ func New(config *DriverConfig) (*FileBackedDevice, error) {
 		isSyncedCtx:            isSyncedCtx,
 		SetSynced:              setSynced,
 		resumable:              config.Resumable,
+		useDblockDriver:        config.UseDblockDriver,
 		log:                    config.Log,
 		copyRateBytesPerSecond: defaultMaxMachineBytesPerSecond,
 		copyRateLock:           &sync.Mutex{},
@@ -201,7 +223,7 @@ func setDefaultsAndCopy(config *DriverConfig) (*DriverConfig, error) {
 	newConfig := &DriverConfig{
 		Source:               config.Source,
 		Backing:              config.Backing,
-		NbdFileName:          config.NbdFileName,
+		BlockDeviceName:      config.BlockDeviceName,
 		ProcessFiles:         append([]string(nil), config.ProcessFiles...),
 		Fs:                   config.Fs,
 		Log:                  config.Log,
@@ -225,8 +247,8 @@ func setDefaultsAndCopy(config *DriverConfig) (*DriverConfig, error) {
 		return nil, err
 	}
 
-	if len(newConfig.NbdFileName) == 0 {
-		err := errors.New("Nbd file name must be provided")
+	if len(newConfig.BlockDeviceName) == 0 {
+		err := errors.New("Block device name must be provided")
 		newConfig.Log.Error(err)
 		return nil, err
 	}
@@ -238,7 +260,7 @@ func setDefaultsAndCopy(config *DriverConfig) (*DriverConfig, error) {
 	return newConfig, nil
 }
 
-// Connect is a blocking function that initiates the NBD device driver
+// Connect both connects the block device driver, as well as blocks while serving user requests
 func (d *FileBackedDevice) Connect() error {
 	d.Resume()
 
@@ -261,23 +283,35 @@ func (d *FileBackedDevice) Connect() error {
 	}
 
 	if d.bd == nil {
-		buseDevice, err := createNbdKernelClient(
-			d.nbdFile,
-			calculateNbdSize(d.Source.Size),
-			d,
-			newBytePool(d.log),
-			d.blockRangePool,
-		)
+		var device KernelClient
+		var err error
+		if d.useDblockDriver {
+			device, err = createDblockKernelClient(
+				d.blockDeviceName,
+				d.Source.Size,
+				d,
+				newBytePool(d.log),
+				d.blockRangePool,
+			)
+		} else {
+			device, err = createNbdKernelClient(
+				d.blockDeviceName,
+				calculateNbdSize(d.Source.Size),
+				d,
+				newBytePool(d.log),
+				d.blockRangePool,
+			)
+		}
 		if err != nil {
 			return err
 		}
-		d.bd = buseDevice
+		d.bd = device
 	}
 
 	return d.bd.Connect()
 }
 
-// Disconnect terminates the NBD driver connection. This call blocks
+// Disconnect terminates the driver connection. This call blocks
 // while write queues are flushing, and the intent log is finalizing.
 // Ending the program without calling disconnect will be treated as a
 // crash for the purposes of resuming.

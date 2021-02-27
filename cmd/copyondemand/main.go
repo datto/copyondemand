@@ -78,9 +78,11 @@ func main() {
 	verboseFlag := false
 	veryVerboseFlag := false
 	preventBackgroundSync := false
+	useDblockDriver := false
 	flag.BoolVar(&verboseFlag, "v", false, "Enable logging to stderr")
 	flag.BoolVar(&veryVerboseFlag, "vv", false, "Enable very verbose logging to stderr")
 	flag.BoolVar(&preventBackgroundSync, "b", false, "Disable background sync thread, for testing purposes only!")
+	flag.BoolVar(&useDblockDriver, "d", false, "Use the kmod-dblock driver rather than the default NBD driver")
 
 	var progressFiles ProgressFiles
 	flag.Var(&progressFiles, "progress-handle", "The path to the file containing the number of active copy-on-demand processes")
@@ -95,7 +97,7 @@ func main() {
 	sig := make(chan os.Signal)
 	signal.Notify(sig, os.Interrupt)
 
-	nbdDevice := args[0]
+	blockDeviceName := args[0]
 	sourceFileName, err := filepath.Abs(args[1])
 	if err != nil {
 		logrus.Fatal(err)
@@ -106,7 +108,7 @@ func main() {
 	}
 
 	verbosity := calculateVerbosityLevel(verboseFlag, veryVerboseFlag)
-	err = setupLogging(verbosity, nbdDevice, sourceFileName, backingFileName)
+	err = setupLogging(verbosity, blockDeviceName, sourceFileName, backingFileName)
 	if err != nil {
 		logrus.Fatal(err)
 	}
@@ -119,12 +121,13 @@ func main() {
 	nbdDriver, err := copyondemand.NewFileBackedDevice(
 		sourceFileName,
 		backingFileName,
-		nbdDevice,
+		blockDeviceName,
 		progressFiles,
 		copyondemand.LocalFs{},
 		logrus.StandardLogger(),
 		!preventBackgroundSync,
 		resumableCopyEnabled,
+		useDblockDriver,
 	)
 
 	if err != nil {
