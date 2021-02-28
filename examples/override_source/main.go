@@ -37,7 +37,7 @@ import (
 
 const (
 	deviceToUse     = "/dev/dblocktest"
-	exampleFileSize = 1024 * 1024 // 1 MB
+	exampleFileSize = 4 * 1024 * 1024 * 1024 // 4 GB
 )
 
 func main() {
@@ -124,7 +124,7 @@ func (f *oneFile) ReadAt(p []byte, off int64) (n int, err error) {
 	requestedReadSize := len(p)
 
 	for ix := range p {
-		p[ix] = 1
+		p[ix] = byte((off + int64(ix)) % 256)
 	}
 
 	return requestedReadSize, nil

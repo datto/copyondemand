@@ -20,6 +20,7 @@ const dblockControlDestroyAllDevices = uint64(25)
 
 const dblockOperationNoResponseBlockForRequest = 30
 const dblockOperationReadResponse = 31
+const dblockDeviceOperationWriteResponse = 37
 const dblockOperationStatus = 39
 const dblockOperationKernelBlockForRequest = 40
 const dblockOperationKernelReadRequest = 41
@@ -57,10 +58,6 @@ type dblockControlDestroyByID struct {
 	force     uint32
 }
 
-type dblockBlock struct {
-	block [dblockBlockSize]byte
-}
-
 type dblockHeader struct {
 	operation    uint32
 	size         uint64
@@ -84,7 +81,7 @@ type dblockOperation struct {
 	metadata    [maxBioSegmentsPerRequest]dblockSegmentMetadata
 	errorCode   uint32
 	operationID uint32
-	buffer      [maxBioSegmentsPerRequest]dblockBlock
+	buffer      [maxBioSegmentsPerRequest * dblockBlockSize]byte
 }
 
 type queuedDblockRequest struct {
