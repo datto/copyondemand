@@ -32,6 +32,9 @@ const dblockIoctlDeviceOperation = uint64(58)
 
 const dblockControlDevicePath = "/dev/dblockctl"
 
+// len("-ctl") + the string needs to be null terminated
+const dblockCtlSuffixLength = 5
+
 type dblockControlCreateDeviceParams struct {
 	deviceName            [maxDiskNameLength]byte
 	kernelBlockSize       uint32

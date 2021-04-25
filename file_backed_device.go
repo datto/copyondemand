@@ -107,8 +107,8 @@ func NewFileBackedDevice(
 			return nil, fmt.Errorf("a block device with the name %s already exists", blockDeviceName)
 		}
 
-		if len(blockDeviceName) > (maxDiskNameLength + 5) {
-			return nil, fmt.Errorf("file name %s is too large", blockDeviceName)
+		if len(blockDeviceName) > (maxDiskNameLength + dblockCtlSuffixLength) {
+			return nil, fmt.Errorf("file name %s is too large, the max file name size is %d", blockDeviceName, (maxDiskNameLength - dblockCtlSuffixLength))
 		}
 	}
 
