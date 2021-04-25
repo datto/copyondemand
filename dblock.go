@@ -5,18 +5,21 @@ import (
 	"os"
 	"sync"
 	"syscall"
-	"unsafe"
 
 	"github.com/sirupsen/logrus"
+)
+
+type IOType int
+
+const (
+	Read IOType = iota
+	Write
 )
 
 /**
  * TODO:
  * * Add multi-threading similar to the NBD driver (1 op buffer per worker, range locking, etc)
- * * Figure out a way to make a safe syscall function, so every Syscall function doesn't have a giant warning
- *     + Handle interrupts more generically
  * * Think through misaligned file sizes (NBD driver rounds up the file size, do we need to do the same here?)
- * * Respond to read and respond to write need to be deduplicated they're mostly identical
  * * Fix broken unit tests
  * * All other in-lined TODO's in this file will be taken care of pre-merge
  */
@@ -43,17 +46,16 @@ func (bd *dblockKernelClient) Connect() error {
 	for !haltRequested {
 		switch operation := op.header.operation; operation {
 		case dblockOperationKernelBlockForRequest:
-			// no-op, we'll do this operation at the beginning of the next loop
 			bd.logger.Debugf("Got a request to wait for work")
 			err = bd.blockForOperation(op)
 			break
 		case dblockOperationKernelReadRequest:
 			bd.logger.Debugf("Got a read request")
-			err = bd.processReadRequest(op)
+			err = bd.processIORequest(Read, op)
 			break
 		case dblockOperationKernelWriteRequest:
 			bd.logger.Debugf("Got a write request")
-			err = bd.processWriteRequest(op)
+			err = bd.processIORequest(Write, op)
 			break
 		case dblockOperationKernelUserspaceExit:
 			bd.logger.Info("Got a request to stop, stopping")
@@ -67,12 +69,12 @@ func (bd *dblockKernelClient) Connect() error {
 	return nil
 }
 
-func (bd *dblockKernelClient) processReadRequest(op *dblockOperation) error {
+func (bd *dblockKernelClient) processIORequest(ioType IOType, op *dblockOperation) error {
 	if op.packet.segmentCount == 0 {
-		return fmt.Errorf("Read segment count is zero, crashing")
+		return fmt.Errorf("IO segment count is zero, crashing")
 	}
 	if op.packet.segmentCount > maxBioSegmentsPerRequest {
-		return fmt.Errorf("Tried to read %d blocks but the max block count is %d, crashing", op.packet.segmentCount, maxBioSegmentsPerRequest)
+		return fmt.Errorf("Tried to perform IO on %d blocks but the max block count is %d, crashing", op.packet.segmentCount, maxBioSegmentsPerRequest)
 	}
 
 	segmentCount := op.packet.segmentCount
@@ -80,7 +82,7 @@ func (bd *dblockKernelClient) processReadRequest(op *dblockOperation) error {
 	currentSegmentStart := uint32(0)
 	for i := uint32(1); i < segmentCount; i++ {
 		if op.metadata[i-1].start+op.metadata[i-1].length != op.metadata[i].start {
-			err := bd.doRead(op, currentSegmentStart, i-1)
+			err := bd.doIO(ioType, op, currentSegmentStart, i-1)
 			if err != nil {
 				return err
 			}
@@ -88,103 +90,51 @@ func (bd *dblockKernelClient) processReadRequest(op *dblockOperation) error {
 		}
 	}
 
-	err := bd.doRead(op, currentSegmentStart, segmentCount-1)
+	err := bd.doIO(ioType, op, currentSegmentStart, segmentCount-1)
 	if err != nil {
 		return err
 	}
 
-	bd.logger.Debugf("Doing ioctl to respond to read request op %d", op.operationID)
+	bd.logger.Debugf("Doing ioctl to respond to IO request op %d", op.operationID)
 	for {
 		op.errorCode = 0
 		op.handleID = bd.deviceHandleID
-		op.header.operation = dblockOperationReadResponse
-		// <*** DANGER *** DANGER *** DANGER ***>
-		// Do not touch me, this line is a compiler hint that guarantees the createParams
-		// struct stays in place in memory while this syscall is being serviced. Read
-		// https://golang.org/pkg/unsafe/ section (4) for additional details.
-		r1, r2, ep := syscall.Syscall(syscall.SYS_IOCTL, bd.deviceControlFp.Fd(), uintptr(dblockIoctlDeviceOperation), uintptr(unsafe.Pointer(op)))
-		// </*** DANGER *** DANGER *** DANGER ***>
+		if ioType == Read {
+			op.header.operation = dblockOperationReadResponse
+		} else if ioType == Write {
+			op.header.operation = dblockOperationWriteResponse
+		}
+
+		ep, err := bd.safeOperationIoctl(bd.deviceControlFp, dblockIoctlDeviceOperation, op)
 		if ep != 0 {
 			// This syscall is interruptable, if we're interrupted try again
 			if ep == syscall.EINTR {
 				continue
 			}
-			return fmt.Errorf("ioctl(%d, %d, %d) read response failed: %s (%d, %d, %d)", bd.deviceControlFp.Fd(), uintptr(dblockIoctlDeviceOperation), uintptr(unsafe.Pointer(op)), syscall.Errno(ep), r1, r2, ep)
+			return err
 		}
-		bd.logger.Debugf("Read respond syscall return (r1, r2, err): (%d, %d, %d)", r1, r2, ep)
+
 		return nil
 	}
 }
 
-func (bd *dblockKernelClient) doRead(op *dblockOperation, startSegmentID uint32, endSegmentID uint32) error {
+func (bd *dblockKernelClient) doIO(ioType IOType, op *dblockOperation, startSegmentID uint32, endSegmentID uint32) error {
 	startSegment := op.metadata[startSegmentID]
 	endSegment := op.metadata[endSegmentID]
 
 	offset := startSegment.start
 	len := endSegment.start - startSegment.start + endSegment.length
 	bufOffset := startSegmentID * dblockBlockSize
+	bufStart := bufOffset
+	bufEnd := uint64(bufOffset) + len
 
-	// TODO remove this
-	bd.logger.Debugf("Read offset = %d, len = %d, bufOffset = %d", offset, len, bufOffset)
-
-	return bd.driver.ReadAt(op.buffer[bufOffset:(uint64(bufOffset)+len)], offset)
-}
-
-func (bd *dblockKernelClient) processWriteRequest(op *dblockOperation) error {
-	// TODO we validate reads, but not writes, writes should also be bounds checked
-	segmentCount := op.packet.segmentCount
-
-	currentSegmentStart := uint32(0)
-	for i := uint32(1); i < segmentCount; i++ {
-		if op.metadata[i-1].start+op.metadata[i-1].length != op.metadata[i].start {
-			err := bd.doWrite(op, currentSegmentStart, i-1)
-			if err != nil {
-				return err
-			}
-			currentSegmentStart = i
-		}
+	if ioType == Read {
+		return bd.driver.ReadAt(op.buffer[bufStart:bufEnd], offset)
+	} else if ioType == Write {
+		return bd.driver.WriteAt(op.buffer[bufStart:bufEnd], offset)
+	} else {
+		return fmt.Errorf("Developer error, invalid io type")
 	}
-
-	err := bd.doWrite(op, currentSegmentStart, segmentCount-1)
-	if err != nil {
-		return err
-	}
-
-	bd.logger.Debugf("Doing ioctl to respond to write request op %d", op.operationID)
-	for {
-		op.errorCode = 0
-		op.handleID = bd.deviceHandleID
-		op.header.operation = dblockDeviceOperationWriteResponse
-		// <*** DANGER *** DANGER *** DANGER ***>
-		// Do not touch me, this line is a compiler hint that guarantees the createParams
-		// struct stays in place in memory while this syscall is being serviced. Read
-		// https://golang.org/pkg/unsafe/ section (4) for additional details.
-		r1, r2, ep := syscall.Syscall(syscall.SYS_IOCTL, bd.deviceControlFp.Fd(), uintptr(dblockIoctlDeviceOperation), uintptr(unsafe.Pointer(op)))
-		// </*** DANGER *** DANGER *** DANGER ***>
-		if ep != 0 {
-			// This syscall is interruptable, if we're interrupted try again
-			if ep == syscall.EINTR {
-				continue
-			}
-			return fmt.Errorf("ioctl(%d, %d, %d) read response failed: %s (%d, %d, %d)", bd.deviceControlFp.Fd(), uintptr(dblockIoctlDeviceOperation), uintptr(unsafe.Pointer(op)), syscall.Errno(ep), r1, r2, ep)
-		}
-		bd.logger.Debugf("Read respond syscall return (r1, r2, err): (%d, %d, %d)", r1, r2, ep)
-		return nil
-	}
-}
-
-func (bd *dblockKernelClient) doWrite(op *dblockOperation, startSegmentID uint32, endSegmentID uint32) error {
-	startSegment := op.metadata[startSegmentID]
-	endSegment := op.metadata[endSegmentID]
-
-	offset := startSegment.start
-	len := endSegment.start - startSegment.start + endSegment.length
-	bufOffset := startSegmentID * dblockBlockSize
-
-	// TODO remove this
-	bd.logger.Debugf("Write offset = %d, len = %d, bufOffset = %d", offset, len, bufOffset)
-
-	return bd.driver.WriteAt(op.buffer[bufOffset:(uint64(bufOffset)+len)], offset)
 }
 
 func (bd *dblockKernelClient) createBlockDevice(
@@ -205,21 +155,14 @@ func (bd *dblockKernelClient) createBlockDevice(
 		errorCode:            0,
 	}
 
-	// <*** DANGER *** DANGER *** DANGER ***>
-	// Do not touch me, this line is a compiler hint that guarantees the createParams
-	// struct stays in place in memory while this syscall is being serviced. Read
-	// https://golang.org/pkg/unsafe/ section (4) for additional details.
-	r1, r2, ep := syscall.Syscall(syscall.SYS_IOCTL, bd.mainControlFp.Fd(), uintptr(dblockControlCreateDevice), uintptr(unsafe.Pointer(createParams)))
-	// </*** DANGER *** DANGER *** DANGER ***>
-	if ep != 0 {
-		return 0, fmt.Errorf("ioctl(%d, %d, %d) failed: %s", bd.mainControlFp.Fd(), uintptr(dblockControlCreateDevice), uintptr(unsafe.Pointer(createParams)), syscall.Errno(ep))
+	err := bd.safeCreateIoctl(bd.mainControlFp, createParams)
+	if err != nil {
+		return 0, err
 	}
-
-	bd.logger.Debugf("Create syscall return (r1, r2, err): (%d, %d, %d)", r1, r2, ep)
 
 	fp, err := os.OpenFile(bd.device+"-ctl", os.O_RDWR, 0600)
 	if err != nil {
-		return 0, fmt.Errorf("Create device appeared to succeed but unable to open the \"%s\" ctl device: %s", bd.device+"-ctl", err)
+		return 0, fmt.Errorf("The create device ioctl appeared to succeed but unable to open the \"%s\" ctl device: %s", bd.device+"-ctl", err)
 	}
 
 	bd.deviceControlFp = fp
@@ -231,20 +174,9 @@ func (bd *dblockKernelClient) blockForOperation(dblockOp *dblockOperation) error
 	dblockOp.header.operation = dblockOperationNoResponseBlockForRequest
 	dblockOp.header.size = 0
 
-	// <*** DANGER *** DANGER *** DANGER ***>
-	// Do not touch me, this line is a compiler hint that guarantees the dblockOp
-	// struct stays in place in memory while this syscall is being serviced. Read
-	// https://golang.org/pkg/unsafe/ section (4) for additional details.
-	r1, r2, ep := syscall.Syscall(syscall.SYS_IOCTL, bd.deviceControlFp.Fd(), uintptr(dblockIoctlDeviceOperation), uintptr(unsafe.Pointer(dblockOp)))
-	// </*** DANGER *** DANGER *** DANGER ***>
+	_, err := bd.safeOperationIoctl(bd.deviceControlFp, dblockIoctlDeviceOperation, dblockOp)
 
-	if ep != 0 {
-		return fmt.Errorf("ioctl(%d, %d, %d) failed: %s (%d, %d, %d)", bd.deviceControlFp.Fd(), uintptr(dblockIoctlDeviceOperation), uintptr(unsafe.Pointer(dblockOp)), syscall.Errno(ep), r1, r2, ep)
-	}
-
-	bd.logger.Debugf("Request syscall return (r1, r2, err): (%d, %d, %d)", r1, r2, ep)
-
-	return nil
+	return err
 }
 
 // Disconnect disconnects the BuseDevice
@@ -255,18 +187,14 @@ func (bd *dblockKernelClient) Disconnect() {
 		force:     0,
 	}
 
-	// <*** DANGER *** DANGER *** DANGER ***>
-	// Do not touch me, this line is a compiler hint that guarantees the dblockOp
-	// struct stays in place in memory while this syscall is being serviced. Read
-	// https://golang.org/pkg/unsafe/ section (4) for additional details.
-	r1, r2, ep := syscall.Syscall(syscall.SYS_IOCTL, bd.mainControlFp.Fd(), uintptr(dblockControlDestroyDeviceByID), uintptr(unsafe.Pointer(destroyParams)))
-	// </*** DANGER *** DANGER *** DANGER ***>
-
-	if ep != 0 {
-		bd.logger.Fatalf("ioctl(%d, %d, %d) to destroy device failed: %s", bd.mainControlFp.Fd(), uintptr(dblockControlDestroyDeviceByID), uintptr(unsafe.Pointer(destroyParams)), syscall.Errno(ep))
+	err := bd.safeDestroyByIdIoctl(bd.mainControlFp, destroyParams)
+	if err != nil {
+		// The options are:
+		// * Potentially be stuck here forever, with the kernel refusing to release us
+		// * Crash
+		// IMO there's no good option but I chose the second.
+		bd.logger.Fatal(err)
 	}
-
-	bd.logger.Debugf("Request syscall return (r1, r2, err): (%d, %d, %d)", r1, r2, ep)
 
 	bd.logger.Debugf("Waiting for kernel to signal exit")
 	bd.disconnectWaitGroup.Wait()

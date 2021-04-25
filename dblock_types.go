@@ -20,7 +20,7 @@ const dblockControlDestroyAllDevices = uint64(25)
 
 const dblockOperationNoResponseBlockForRequest = 30
 const dblockOperationReadResponse = 31
-const dblockDeviceOperationWriteResponse = 37
+const dblockOperationWriteResponse = 37
 const dblockOperationStatus = 39
 const dblockOperationKernelBlockForRequest = 40
 const dblockOperationKernelReadRequest = 41

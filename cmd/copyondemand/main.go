@@ -78,17 +78,28 @@ func main() {
 	verboseFlag := false
 	veryVerboseFlag := false
 	preventBackgroundSync := false
+	kernelDriver := ""
 	useDblockDriver := false
 	flag.BoolVar(&verboseFlag, "v", false, "Enable logging to stderr")
 	flag.BoolVar(&veryVerboseFlag, "vv", false, "Enable very verbose logging to stderr")
 	flag.BoolVar(&preventBackgroundSync, "b", false, "Disable background sync thread, for testing purposes only!")
-	flag.BoolVar(&useDblockDriver, "d", false, "Use the kmod-dblock driver rather than the default NBD driver")
+	flag.StringVar(&kernelDriver, "d", "nbd", "Which kernel driver to use, current options are: nbd (default) or dblock (experimental)")
 
 	var progressFiles ProgressFiles
 	flag.Var(&progressFiles, "progress-handle", "The path to the file containing the number of active copy-on-demand processes")
 	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
+
+	switch kernelDriver {
+	case "nbd":
+		useDblockDriver = false
+	case "dblock":
+		useDblockDriver = true
+	default:
+		logrus.Fatalf("Invalid kernel driver %s", kernelDriver)
+	}
+
 	if len(args) < 3 {
 		usage()
 	}
