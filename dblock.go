@@ -25,10 +25,8 @@ const (
  */
 
 // Connect connects a dblock device to an actual device file
-// and starts handling requests. It does not return until it's done serving requests.
+// and starts handling requests. It does not return until it's done serving requests (i.e. until the block device is torn down).
 func (bd *dblockKernelClient) Connect() error {
-	bd.disconnectWaitGroup.Add(1)
-	defer bd.disconnectWaitGroup.Done()
 	handleID, err := bd.createBlockDevice(bd.device[5:], dblockBlockSize, bd.size/dblockBlockSize, 30)
 
 	if err != nil {
@@ -38,38 +36,51 @@ func (bd *dblockKernelClient) Connect() error {
 	bd.logger.Debugf("Got handleID = %d", handleID)
 	bd.deviceHandleID = handleID
 
-	haltRequested := false
-	op := &dblockOperation{}
-	op.handleID = bd.deviceHandleID
-	op.header.size = 0
-	op.header.operation = dblockOperationKernelBlockForRequest
-	for !haltRequested {
-		switch operation := op.header.operation; operation {
-		case dblockOperationKernelBlockForRequest:
-			bd.logger.Debugf("Got a request to wait for work")
-			err = bd.blockForOperation(op)
-			break
-		case dblockOperationKernelReadRequest:
-			bd.logger.Debugf("Got a read request")
-			err = bd.processIORequest(Read, op)
-			break
-		case dblockOperationKernelWriteRequest:
-			bd.logger.Debugf("Got a write request")
-			err = bd.processIORequest(Write, op)
-			break
-		case dblockOperationKernelUserspaceExit:
-			bd.logger.Info("Got a request to stop, stopping")
-			haltRequested = true
-		}
-		if err != nil {
-			return fmt.Errorf("Error processing request '%s' crashing", err)
-		}
+	for i := 0; i < 2; i++ {
+		go func() {
+			bd.disconnectWaitGroup.Add(1)
+			defer bd.disconnectWaitGroup.Done()
+
+			controlFp, err := os.OpenFile(bd.device+"-ctl", os.O_RDWR, 0600)
+			if err != nil {
+				logrus.Fatalf("The create device ioctl appeared to succeed but unable to open the \"%s\" ctl device: %s", bd.device+"-ctl", err)
+			}
+			haltRequested := false
+			op := &dblockOperation{}
+			op.handleID = bd.deviceHandleID
+			op.header.size = 0
+			op.header.operation = dblockOperationKernelBlockForRequest
+			for !haltRequested {
+				controlFileDescriptor := controlFp.Fd()
+				switch operation := op.header.operation; operation {
+				case dblockOperationKernelBlockForRequest:
+					bd.logger.Debugf("Got a request on %d to wait for work", controlFileDescriptor)
+					err = bd.blockForOperation(controlFp, op)
+					break
+				case dblockOperationKernelReadRequest:
+					bd.logger.Debugf("Got a read request on %d", controlFileDescriptor)
+					err = bd.processIORequest(Read, controlFp, op)
+					break
+				case dblockOperationKernelWriteRequest:
+					bd.logger.Debugf("Got a write request on %d", controlFileDescriptor)
+					err = bd.processIORequest(Write, controlFp, op)
+					break
+				case dblockOperationKernelUserspaceExit:
+					bd.logger.Infof("Got a request to stop on %d, stopping", controlFileDescriptor)
+					haltRequested = true
+				}
+				if err != nil {
+					logrus.Fatalf("Error processing request on %d '%s' crashing", controlFileDescriptor, err)
+				}
+			}
+		}()
 	}
 
+	bd.disconnectWaitGroup.Wait()
 	return nil
 }
 
-func (bd *dblockKernelClient) processIORequest(ioType IOType, op *dblockOperation) error {
+func (bd *dblockKernelClient) processIORequest(ioType IOType, controlFile *os.File, op *dblockOperation) error {
 	if op.packet.segmentCount == 0 {
 		return fmt.Errorf("IO segment count is zero, crashing")
 	}
@@ -95,7 +106,7 @@ func (bd *dblockKernelClient) processIORequest(ioType IOType, op *dblockOperatio
 		return err
 	}
 
-	bd.logger.Debugf("Doing ioctl to respond to IO request op %d", op.operationID)
+	bd.logger.Debugf("Doing ioctl on %d to respond to IO request op %d", controlFile.Fd(), op.operationID)
 	for {
 		op.errorCode = 0
 		op.handleID = bd.deviceHandleID
@@ -105,7 +116,7 @@ func (bd *dblockKernelClient) processIORequest(ioType IOType, op *dblockOperatio
 			op.header.operation = dblockOperationWriteResponse
 		}
 
-		ep, err := bd.safeOperationIoctl(bd.deviceControlFp, dblockIoctlDeviceOperation, op)
+		ep, err := bd.safeOperationIoctl(controlFile, dblockIoctlDeviceOperation, op)
 		if ep != 0 {
 			// This syscall is interruptable, if we're interrupted try again
 			if ep == syscall.EINTR {
@@ -160,21 +171,23 @@ func (bd *dblockKernelClient) createBlockDevice(
 		return 0, err
 	}
 
-	fp, err := os.OpenFile(bd.device+"-ctl", os.O_RDWR, 0600)
-	if err != nil {
-		return 0, fmt.Errorf("The create device ioctl appeared to succeed but unable to open the \"%s\" ctl device: %s", bd.device+"-ctl", err)
-	}
+	/*
+		fp, err := os.OpenFile(bd.device+"-ctl", os.O_RDWR, 0600)
+		if err != nil {
+			return 0, fmt.Errorf("The create device ioctl appeared to succeed but unable to open the \"%s\" ctl device: %s", bd.device+"-ctl", err)
+		}
 
-	bd.deviceControlFp = fp
+		bd.deviceControlFp = fp
+	*/
 
 	return createParams.handleID, nil
 }
 
-func (bd *dblockKernelClient) blockForOperation(dblockOp *dblockOperation) error {
+func (bd *dblockKernelClient) blockForOperation(controlFile *os.File, dblockOp *dblockOperation) error {
 	dblockOp.header.operation = dblockOperationNoResponseBlockForRequest
 	dblockOp.header.size = 0
 
-	_, err := bd.safeOperationIoctl(bd.deviceControlFp, dblockIoctlDeviceOperation, dblockOp)
+	_, err := bd.safeOperationIoctl(controlFile, dblockIoctlDeviceOperation, dblockOp)
 
 	return err
 }
