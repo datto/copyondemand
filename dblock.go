@@ -18,7 +18,6 @@ const (
 
 /**
  * TODO:
- * * Add multi-threading similar to the NBD driver (1 op buffer per worker, range locking, etc)
  * * Think through misaligned file sizes (NBD driver rounds up the file size, do we need to do the same here?)
  * * Fix broken unit tests
  * * All other in-lined TODO's in this file will be taken care of pre-merge
@@ -36,48 +35,55 @@ func (bd *dblockKernelClient) Connect() error {
 	bd.logger.Debugf("Got handleID = %d", handleID)
 	bd.deviceHandleID = handleID
 
-	for i := 0; i < 2; i++ {
-		go func() {
-			bd.disconnectWaitGroup.Add(1)
-			defer bd.disconnectWaitGroup.Done()
-
-			controlFp, err := os.OpenFile(bd.device+"-ctl", os.O_RDWR, 0600)
-			if err != nil {
-				logrus.Fatalf("The create device ioctl appeared to succeed but unable to open the \"%s\" ctl device: %s", bd.device+"-ctl", err)
-			}
-			haltRequested := false
-			op := &dblockOperation{}
-			op.handleID = bd.deviceHandleID
-			op.header.size = 0
-			op.header.operation = dblockOperationKernelBlockForRequest
-			for !haltRequested {
-				controlFileDescriptor := controlFp.Fd()
-				switch operation := op.header.operation; operation {
-				case dblockOperationKernelBlockForRequest:
-					bd.logger.Debugf("Got a request on %d to wait for work", controlFileDescriptor)
-					err = bd.blockForOperation(controlFp, op)
-					break
-				case dblockOperationKernelReadRequest:
-					bd.logger.Debugf("Got a read request on %d", controlFileDescriptor)
-					err = bd.processIORequest(Read, controlFp, op)
-					break
-				case dblockOperationKernelWriteRequest:
-					bd.logger.Debugf("Got a write request on %d", controlFileDescriptor)
-					err = bd.processIORequest(Write, controlFp, op)
-					break
-				case dblockOperationKernelUserspaceExit:
-					bd.logger.Infof("Got a request to stop on %d, stopping", controlFileDescriptor)
-					haltRequested = true
-				}
-				if err != nil {
-					logrus.Fatalf("Error processing request on %d '%s' crashing", controlFileDescriptor, err)
-				}
-			}
-		}()
+	// We could technically `go` all the way through
+	// this for loop before hitting the .Wait(), this
+	// Add prevents that.
+	bd.disconnectWaitGroup.Add(1)
+	for i := 0; i < requestWorkerCount; i++ {
+		go bd.requestWorker()
 	}
+	bd.disconnectWaitGroup.Done()
 
 	bd.disconnectWaitGroup.Wait()
 	return nil
+}
+
+func (bd *dblockKernelClient) requestWorker() {
+	bd.disconnectWaitGroup.Add(1)
+	defer bd.disconnectWaitGroup.Done()
+
+	controlFp, err := os.OpenFile(bd.device+"-ctl", os.O_RDWR, 0600)
+	if err != nil {
+		logrus.Fatalf("The create device ioctl appeared to succeed but unable to open the \"%s\" ctl device: %s", bd.device+"-ctl", err)
+	}
+	haltRequested := false
+	op := &dblockOperation{}
+	op.handleID = bd.deviceHandleID
+	op.header.size = 0
+	op.header.operation = dblockOperationKernelBlockForRequest
+	for !haltRequested {
+		controlFileDescriptor := controlFp.Fd()
+		switch operation := op.header.operation; operation {
+		case dblockOperationKernelBlockForRequest:
+			bd.logger.Debugf("Got a request on %d to wait for work", controlFileDescriptor)
+			err = bd.blockForOperation(controlFp, op)
+			break
+		case dblockOperationKernelReadRequest:
+			bd.logger.Debugf("Got a read request on %d", controlFileDescriptor)
+			err = bd.processIORequest(Read, controlFp, op)
+			break
+		case dblockOperationKernelWriteRequest:
+			bd.logger.Debugf("Got a write request on %d", controlFileDescriptor)
+			err = bd.processIORequest(Write, controlFp, op)
+			break
+		case dblockOperationKernelUserspaceExit:
+			bd.logger.Infof("Got a request to stop on %d, stopping", controlFileDescriptor)
+			haltRequested = true
+		}
+		if err != nil {
+			logrus.Fatalf("Error processing request on %d '%s' crashing", controlFileDescriptor, err)
+		}
+	}
 }
 
 func (bd *dblockKernelClient) processIORequest(ioType IOType, controlFile *os.File, op *dblockOperation) error {
@@ -138,6 +144,16 @@ func (bd *dblockKernelClient) doIO(ioType IOType, op *dblockOperation, startSegm
 	bufOffset := startSegmentID * dblockBlockSize
 	bufStart := bufOffset
 	bufEnd := uint64(bufOffset) + len
+
+	// Note: I'm not pooling this BlockRange alloc because
+	// the go compiler is smart enough to put this on the stack
+	// Proof:
+	// $ go build -gcflags="-m" ./ 2>&1 | grep dblock | grep '&BlockRange literal'
+	// ./dblock.go[...]: &BlockRange literal does not escape
+	affectedBlocks := &BlockRange{}
+	getAffectedBlockRange(len, uint64(offset), affectedBlocks)
+	bd.rangeLocker.LockRange(affectedBlocks.Start, affectedBlocks.End)
+	defer bd.rangeLocker.UnlockRange(affectedBlocks.Start, affectedBlocks.End)
 
 	if ioType == Read {
 		return bd.driver.ReadAt(op.buffer[bufStart:bufEnd], offset)
