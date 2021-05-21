@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Integration test for copy on demand
 # Tests:
 #  * Full read/write
@@ -5,11 +7,11 @@
 #  * Read/write random sizes and offsets $fuzz_count times
 
 block_size=4096 # 4k bytes
-create_blocks=100 # How many $block_size blocks to generate for test
+create_blocks=262144 # How many $block_size blocks to generate for test
 source_file='./test.dat'
 backing_file='./test.dat.bak'
-cod_executable='/usr/bin/copy-on-demand'
-nbd_device='/dev/nbd0'
+cod_executable='/home/behrlich/copyondemand/copy-on-demand'
+nbd_device='/dev/dblockgauntlet'
 offset_test_offset=1
 fuzz_count=100
 cod_pid=0
@@ -22,11 +24,12 @@ function checkPrerequisites() {
         exit 1
     fi
 
-    if [ ! -b "$nbd_device" ]
-    then
-        echo "Could not find nbd block device, did you modprobe nbd?"
-        exit 1
-    fi
+    # TODO, this doesn't make sense for kmod-dblock
+    #if [ ! -b "$nbd_device" ]
+    #then
+    #    echo "Could not find nbd block device, did you modprobe nbd?"
+    #    exit 1
+    #fi
 
     if [ -f "$source_file" ] || [ -f "$backing_file" ]
     then
@@ -43,7 +46,7 @@ function generateSource() {
 }
 
 function bootCod() {
-    $cod_executable -b $nbd_device $source_file $backing_file &
+    $cod_executable -d -b $nbd_device $source_file $backing_file &
     cod_pid=$!
     sleep $init_sleep
 }

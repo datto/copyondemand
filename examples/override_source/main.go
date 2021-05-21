@@ -32,11 +32,12 @@ import (
 	"os/signal"
 
 	"github.com/datto/copyondemand"
+	"github.com/sirupsen/logrus"
 )
 
 const (
-	nbdToUse        = "/dev/nbd0"
-	exampleFileSize = 1024 * 1024 // 1 MB
+	deviceToUse     = "/dev/dblocktest"
+	exampleFileSize = 4 * 1024 * 1024 * 1024 // 4 GB
 )
 
 func main() {
@@ -57,13 +58,16 @@ func main() {
 	if err != nil {
 		fmt.Printf("Could not open ./backing.bak: %s\n", err)
 	}
-
+	logger := logrus.StandardLogger()
+	logger.SetLevel(logrus.DebugLevel)
 	config := &copyondemand.DriverConfig{
 		Source:               sourceFile,
 		Backing:              backingFile,
-		NbdFileName:          nbdToUse,
+		BlockDeviceName:      deviceToUse,
 		EnableBackgroundSync: false,
 		Resumable:            false,
+		UseDblockDriver:      true,
+		Log:                  logger,
 	}
 
 	driver, err := copyondemand.New(config)
@@ -82,6 +86,7 @@ func main() {
 			errorChan <- err
 		} else {
 			fmt.Println("Driver stopped gracefully.")
+			errorChan <- nil
 		}
 	}(errorChan)
 
@@ -90,8 +95,10 @@ func main() {
 		// Received SIGINT, cancel the sync operation and clean up
 		break
 	case err := <-errorChan:
-		// Recieved an error, cancel the sync operation and clean up
-		fmt.Printf("Driver stopped with error: %s\n", err)
+		if err != nil {
+			// Recieved an error, cancel the sync operation and clean up
+			fmt.Printf("Driver stopped with error: %s\n", err)
+		}
 		break
 	}
 
@@ -117,7 +124,7 @@ func (f *oneFile) ReadAt(p []byte, off int64) (n int, err error) {
 	requestedReadSize := len(p)
 
 	for ix := range p {
-		p[ix] = 1
+		p[ix] = byte((off + int64(ix)) % 256)
 	}
 
 	return requestedReadSize, nil

@@ -66,7 +66,7 @@ func (i *ProgressFiles) Set(value string) error {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s [-v] [-vv] [--progress-handle file_path] /dev/nbdX [file_to_mirror] [backing_file]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s [-v] [-vv] [-b] [--progress-handle file_path] /dev/X [file_to_mirror] [backing_file]\n", os.Args[0])
 	flag.PrintDefaults()
 
 	os.Exit(2)
@@ -78,15 +78,28 @@ func main() {
 	verboseFlag := false
 	veryVerboseFlag := false
 	preventBackgroundSync := false
+	kernelDriver := ""
+	useDblockDriver := false
 	flag.BoolVar(&verboseFlag, "v", false, "Enable logging to stderr")
 	flag.BoolVar(&veryVerboseFlag, "vv", false, "Enable very verbose logging to stderr")
 	flag.BoolVar(&preventBackgroundSync, "b", false, "Disable background sync thread, for testing purposes only!")
+	flag.StringVar(&kernelDriver, "d", "nbd", "Which kernel driver to use, current options are: nbd (default) or dblock (experimental)")
 
 	var progressFiles ProgressFiles
 	flag.Var(&progressFiles, "progress-handle", "The path to the file containing the number of active copy-on-demand processes")
 	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
+
+	switch kernelDriver {
+	case "nbd":
+		useDblockDriver = false
+	case "dblock":
+		useDblockDriver = true
+	default:
+		logrus.Fatalf("Invalid kernel driver %s", kernelDriver)
+	}
+
 	if len(args) < 3 {
 		usage()
 	}
@@ -95,7 +108,7 @@ func main() {
 	sig := make(chan os.Signal)
 	signal.Notify(sig, os.Interrupt)
 
-	nbdDevice := args[0]
+	blockDeviceName := args[0]
 	sourceFileName, err := filepath.Abs(args[1])
 	if err != nil {
 		logrus.Fatal(err)
@@ -106,7 +119,7 @@ func main() {
 	}
 
 	verbosity := calculateVerbosityLevel(verboseFlag, veryVerboseFlag)
-	err = setupLogging(verbosity, nbdDevice, sourceFileName, backingFileName)
+	err = setupLogging(verbosity, blockDeviceName, sourceFileName, backingFileName)
 	if err != nil {
 		logrus.Fatal(err)
 	}
@@ -119,12 +132,13 @@ func main() {
 	nbdDriver, err := copyondemand.NewFileBackedDevice(
 		sourceFileName,
 		backingFileName,
-		nbdDevice,
+		blockDeviceName,
 		progressFiles,
 		copyondemand.LocalFs{},
 		logrus.StandardLogger(),
 		!preventBackgroundSync,
 		resumableCopyEnabled,
+		useDblockDriver,
 	)
 
 	if err != nil {
